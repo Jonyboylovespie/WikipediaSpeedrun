@@ -336,11 +336,12 @@ func (wp *WikiProcessor) saveGraph(outputPath string) error {
 }
 
 func main() {
-	dir, err := os.Getwd()
+	cur, err := os.Getwd()
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 		return
 	}
+	dir := filepath.Dir(cur)
 
 	xmlFilePath := filepath.Join(dir, "Data", "enwiki-latest-pages-articles.xml")
 	outputPath := filepath.Join(dir, "Data", "wikipedia_graph_go.json")
