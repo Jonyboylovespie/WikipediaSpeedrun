@@ -378,7 +378,7 @@ func runInteractiveMode(graph *WikiGraph) {
 }
 
 func main() {
-    graphFilePath := "C:/WikiDump/wikipedia_graph_go.json"
+    graphFilePath := "C:/WikiDump/wikipedia_graph_go.gob"
 
 	// Check if custom path is provided as command line argument
 	if len(os.Args) > 1 {
