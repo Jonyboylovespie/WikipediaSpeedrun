@@ -4,334 +4,428 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/gob"
+	"flag"
 	"fmt"
-	"github.com/edsrzf/mmap-go"
-	"io"
 	"log"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/edsrzf/mmap-go"
 )
 
-type ProgressReader struct {
-	Reader     io.Reader
-	Size       int64
-	BytesRead  int64
-	ReportFunc func(bytesRead, total int64)
+const graphFormatVersion = 1
+
+// SerializedGraph is the compact on-disk format produced by Dump.
+type SerializedGraph struct {
+	Version uint32
+	Titles  []string
+	Edges   [][]uint32
 }
 
-func (pr *ProgressReader) Read(p []byte) (int, error) {
-	n, err := pr.Reader.Read(p)
-	pr.BytesRead += int64(n)
-	if pr.ReportFunc != nil {
-		pr.ReportFunc(pr.BytesRead, pr.Size)
-	}
-	return n, err
-}
-
-// WikiGraph represents the Wikipedia link graph
+// WikiGraph is an ID-based directed graph for fast shortest-path queries.
 type WikiGraph struct {
-	adjacencyList map[string][]string
-	nodeCount     int
+	titles      []string
+	edges       [][]uint32
+	reverse     [][]uint32
+	titleToID   map[string]uint32
+	nodeCount   int
+	totalEdges  int
+	titleSearch []string
 }
 
-// PathResult contains the result of a BFS search
+// PathResult contains the result of a shortest-path search.
 type PathResult struct {
 	Found        bool
 	Path         []string
 	PathLength   int
 	SearchTime   time.Duration
 	NodesVisited int
+	StartOutDeg  int
+	EndInDeg     int
 }
 
-// Helper to create a progress bar display
-func createProgressBar(filePath string) (*os.File, *ProgressReader, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, nil, err
+func formatDurationMilliseconds(d time.Duration) string {
+	if d <= 0 {
+		return "<0.001ms"
 	}
-
-	info, err := file.Stat()
-	if err != nil {
-		file.Close()
-		return nil, nil, err
-	}
-
-	reader := &ProgressReader{
-		Reader: file,
-		Size:   info.Size(),
-		ReportFunc: func(bytesRead, total int64) {
-			percent := float64(bytesRead) * 100 / float64(total)
-			width := 40
-			completed := int(percent * float64(width) / 100)
-
-			fmt.Printf("\r[%s%s] %.1f%% ",
-				strings.Repeat("=", completed),
-				strings.Repeat(" ", width-completed),
-				percent)
-		},
-	}
-
-	return file, reader, nil
+	return fmt.Sprintf("%.3fms", float64(d)/float64(time.Millisecond))
 }
 
-func NewWikiGraphFromGob(filepath string) (*WikiGraph, error) {
-	log.Printf("Loading Wikipedia graph from Gob: %s", filepath)
-	startTime := time.Now()
-
-	// Open the file
-	file, err := os.Open(filepath)
+func loadSerializedGraph(path string) (*SerializedGraph, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("error opening file: %w", err)
+		return nil, fmt.Errorf("error opening graph file: %w", err)
 	}
 	defer file.Close()
 
-	// Memory map the file
-	mmapData, err := mmap.Map(file, mmap.RDONLY, 0)
+	data, err := mmap.Map(file, mmap.RDONLY, 0)
 	if err != nil {
-		return nil, fmt.Errorf("error memory mapping file: %w", err)
+		return nil, fmt.Errorf("error memory-mapping graph file: %w", err)
 	}
-	defer mmapData.Unmap()
+	defer data.Unmap()
 
-	// Decode directly from the memory-mapped data
-	fmt.Println("Decoding graph data from memory-mapped file...")
-	decodeStart := time.Now()
-
-	var adjList map[string][]string
-	decoder := gob.NewDecoder(bytes.NewReader(mmapData))
-	if err := decoder.Decode(&adjList); err != nil {
-		return nil, fmt.Errorf("error decoding Gob: %w", err)
+	var graph SerializedGraph
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&graph); err == nil {
+		if graph.Version != graphFormatVersion {
+			return nil, fmt.Errorf("unsupported graph version %d", graph.Version)
+		}
+		return &graph, nil
 	}
 
-	loadTime := time.Since(startTime)
-	decodeTime := time.Since(decodeStart)
+	legacy, err := loadLegacyGraph(path)
+	if err != nil {
+		return nil, err
+	}
+	return legacy, nil
+}
 
-	log.Printf("Graph loaded in %s (mmap: %s, decode: %s). Nodes: %d",
-		loadTime, loadTime-decodeTime, decodeTime, len(adjList))
+func loadLegacyGraph(path string) (*SerializedGraph, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("error opening legacy graph file: %w", err)
+	}
+	defer file.Close()
 
-	return &WikiGraph{
-		adjacencyList: adjList,
-		nodeCount:     len(adjList),
+	var adj map[string][]string
+	if err := gob.NewDecoder(bufio.NewReader(file)).Decode(&adj); err != nil {
+		return nil, fmt.Errorf("error decoding graph gob: %w", err)
+	}
+
+	log.Println("Loaded legacy graph format; converting to compact layout...")
+
+	titles := make([]string, 0, len(adj))
+	for title := range adj {
+		titles = append(titles, title)
+	}
+
+	titleToID := make(map[string]uint32, len(titles))
+	for i, title := range titles {
+		titleToID[title] = uint32(i)
+	}
+
+	edges := make([][]uint32, len(titles))
+	for i, title := range titles {
+		neighbors := adj[title]
+		if len(neighbors) == 0 {
+			continue
+		}
+
+		mapped := make([]uint32, 0, len(neighbors))
+		for _, neighbor := range neighbors {
+			id, ok := titleToID[neighbor]
+			if !ok {
+				continue
+			}
+			mapped = append(mapped, id)
+		}
+
+		edges[i] = mapped
+	}
+
+	return &SerializedGraph{
+		Version: graphFormatVersion,
+		Titles:  titles,
+		Edges:   edges,
 	}, nil
 }
 
-// normalizeTitle normalizes article titles for consistent lookup
+func NewWikiGraphFromGob(path string) (*WikiGraph, error) {
+	log.Printf("Loading Wikipedia graph from %s", path)
+	start := time.Now()
+
+	serialized, err := loadSerializedGraph(path)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(serialized.Titles) != len(serialized.Edges) {
+		return nil, fmt.Errorf("invalid graph: %d titles and %d edge rows", len(serialized.Titles), len(serialized.Edges))
+	}
+
+	titleToID := make(map[string]uint32, len(serialized.Titles))
+	titleSearch := make([]string, len(serialized.Titles))
+	for i, title := range serialized.Titles {
+		titleToID[title] = uint32(i)
+		titleSearch[i] = strings.ToLower(title)
+	}
+
+	reverse := make([][]uint32, len(serialized.Edges))
+	totalEdges := 0
+	for from, neighbors := range serialized.Edges {
+		totalEdges += len(neighbors)
+		for _, to := range neighbors {
+			if int(to) >= len(reverse) {
+				continue
+			}
+			reverse[to] = append(reverse[to], uint32(from))
+		}
+	}
+
+	graph := &WikiGraph{
+		titles:      serialized.Titles,
+		edges:       serialized.Edges,
+		reverse:     reverse,
+		titleToID:   titleToID,
+		nodeCount:   len(serialized.Titles),
+		totalEdges:  totalEdges,
+		titleSearch: titleSearch,
+	}
+
+	log.Printf("Graph loaded in %s. Nodes: %d, Edges: %d", time.Since(start), graph.nodeCount, graph.totalEdges)
+	return graph, nil
+}
+
 func (wg *WikiGraph) normalizeTitle(title string) string {
 	title = strings.TrimSpace(title)
 	title = strings.ReplaceAll(title, "_", " ")
-
-	if len(title) == 0 {
+	if title == "" {
 		return title
 	}
-
-	// Basic capitalization
 	return strings.ToUpper(string(title[0])) + title[1:]
 }
 
-// ArticleExists checks if an article exists in the graph
-func (wg *WikiGraph) ArticleExists(title string) bool {
+func (wg *WikiGraph) titleID(title string) (uint32, bool) {
 	normalized := wg.normalizeTitle(title)
-	_, exists := wg.adjacencyList[normalized]
-	return exists
+	id, ok := wg.titleToID[normalized]
+	return id, ok
 }
 
-// GetSimilarTitles finds articles with similar titles (for suggestions)
+// ArticleExists checks if an article exists in the graph.
+func (wg *WikiGraph) ArticleExists(title string) bool {
+	_, ok := wg.titleID(title)
+	return ok
+}
+
+// GetSimilarTitles finds articles with similar titles.
 func (wg *WikiGraph) GetSimilarTitles(title string, maxResults int) []string {
+	if maxResults <= 0 {
+		return nil
+	}
+
 	normalized := strings.ToLower(wg.normalizeTitle(title))
-	var similar []string
+	if normalized == "" {
+		return nil
+	}
 
-	count := 0
-	for articleTitle := range wg.adjacencyList {
-		if count >= maxResults {
-			break
-		}
-
-		lowerTitle := strings.ToLower(articleTitle)
-		if strings.Contains(lowerTitle, normalized) || strings.Contains(normalized, lowerTitle) {
-			similar = append(similar, articleTitle)
-			count++
+	results := make([]string, 0, maxResults)
+	for i, lower := range wg.titleSearch {
+		if strings.Contains(lower, normalized) || strings.Contains(normalized, lower) {
+			results = append(results, wg.titles[i])
+			if len(results) >= maxResults {
+				break
+			}
 		}
 	}
 
-	return similar
+	return results
 }
 
-// BFS performs breadth-first search to find shortest path
+func (wg *WikiGraph) expandFrontier(
+	frontier []uint32,
+	adj [][]uint32,
+	visitedThis map[uint32]struct{},
+	visitedOther map[uint32]struct{},
+	parentThis map[uint32]uint32,
+) ([]uint32, uint32, int, bool) {
+	next := make([]uint32, 0, len(frontier)*4)
+	newVisits := 0
+
+	for _, node := range frontier {
+		for _, neighbor := range adj[node] {
+			if _, seen := visitedThis[neighbor]; seen {
+				continue
+			}
+
+			visitedThis[neighbor] = struct{}{}
+			parentThis[neighbor] = node
+			newVisits++
+
+			if _, found := visitedOther[neighbor]; found {
+				return next, neighbor, newVisits, true
+			}
+
+			next = append(next, neighbor)
+		}
+	}
+
+	return next, 0, newVisits, false
+}
+
+func reverseIDs(ids []uint32) {
+	for left, right := 0, len(ids)-1; left < right; left, right = left+1, right-1 {
+		ids[left], ids[right] = ids[right], ids[left]
+	}
+}
+
+func (wg *WikiGraph) reconstructBidirectionalPath(
+	meet, start, end uint32,
+	parentStart map[uint32]uint32,
+	parentEnd map[uint32]uint32,
+) []string {
+	left := make([]uint32, 0, 16)
+	current := meet
+	left = append(left, current)
+	for current != start {
+		current = parentStart[current]
+		left = append(left, current)
+	}
+	reverseIDs(left)
+
+	right := make([]uint32, 0, 16)
+	current = meet
+	for current != end {
+		current = parentEnd[current]
+		right = append(right, current)
+	}
+
+	pathIDs := append(left, right...)
+	path := make([]string, len(pathIDs))
+	for i, id := range pathIDs {
+		path[i] = wg.titles[id]
+	}
+
+	return path
+}
+
+// BFS runs bidirectional BFS to find the shortest directed path.
 func (wg *WikiGraph) BFS(startTitle, endTitle string) PathResult {
-	start := wg.normalizeTitle(startTitle)
-	end := wg.normalizeTitle(endTitle)
-
 	searchStart := time.Now()
+	result := PathResult{}
 
-	result := PathResult{
-		Found:        false,
-		Path:         nil,
-		PathLength:   0,
-		NodesVisited: 0,
-	}
-
-	// Check if start and end articles exist
-	if !wg.ArticleExists(start) {
-		log.Printf("Start article '%s' not found in graph", start)
+	startID, ok := wg.titleID(startTitle)
+	if !ok {
 		result.SearchTime = time.Since(searchStart)
 		return result
 	}
 
-	if !wg.ArticleExists(end) {
-		log.Printf("End article '%s' not found in graph", end)
+	endID, ok := wg.titleID(endTitle)
+	if !ok {
 		result.SearchTime = time.Since(searchStart)
 		return result
 	}
 
-	// Handle case where start equals end
-	if start == end {
+	result.StartOutDeg = len(wg.edges[startID])
+	result.EndInDeg = len(wg.reverse[endID])
+
+	if startID == endID {
 		result.Found = true
-		result.Path = []string{start}
+		result.Path = []string{wg.titles[startID]}
 		result.PathLength = 1
 		result.NodesVisited = 1
 		result.SearchTime = time.Since(searchStart)
 		return result
 	}
 
-	// BFS implementation
-	queue := []string{start}
-	visited := make(map[string]bool)
-	parent := make(map[string]string)
+	frontStart := []uint32{startID}
+	frontEnd := []uint32{endID}
 
-	visited[start] = true
-	nodesVisited := 1
+	visitedStart := map[uint32]struct{}{startID: {}}
+	visitedEnd := map[uint32]struct{}{endID: {}}
+	parentStart := make(map[uint32]uint32)
+	parentEnd := make(map[uint32]uint32)
 
-	log.Printf("Starting BFS from '%s' to '%s'...", start, end)
+	nodesVisited := 2
 
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-
-		// Check neighbors
-		for _, neighbor := range wg.adjacencyList[current] {
-			if !visited[neighbor] {
-				visited[neighbor] = true
-				parent[neighbor] = current
-				queue = append(queue, neighbor)
-				nodesVisited++
-
-				// Found the target
-				if neighbor == end {
-					// Reconstruct path
-					path := wg.reconstructPath(parent, start, end)
-
-					result.Found = true
-					result.Path = path
-					result.PathLength = len(path)
-					result.NodesVisited = nodesVisited
-					result.SearchTime = time.Since(searchStart)
-
-					return result
-				}
+	for len(frontStart) > 0 && len(frontEnd) > 0 {
+		if len(frontStart) <= len(frontEnd) {
+			next, meet, added, found := wg.expandFrontier(frontStart, wg.edges, visitedStart, visitedEnd, parentStart)
+			nodesVisited += added
+			frontStart = next
+			if found {
+				path := wg.reconstructBidirectionalPath(meet, startID, endID, parentStart, parentEnd)
+				result.Found = true
+				result.Path = path
+				result.PathLength = len(path)
+				result.NodesVisited = nodesVisited
+				result.SearchTime = time.Since(searchStart)
+				return result
 			}
-		}
-
-		// Progress reporting for long searches
-		if nodesVisited%1000000 == 0 {
-			elapsed := time.Since(searchStart)
-			log.Printf("BFS progress: %d nodes visited, %d in queue, elapsed: %s",
-				nodesVisited, len(queue), elapsed)
-		}
-
-		// Safety check to prevent infinite search
-		if nodesVisited > 1000000000 { // 1 billion nodes
-			log.Printf("Search stopped after visiting %d nodes (safety limit)", nodesVisited)
-			break
+		} else {
+			next, meet, added, found := wg.expandFrontier(frontEnd, wg.reverse, visitedEnd, visitedStart, parentEnd)
+			nodesVisited += added
+			frontEnd = next
+			if found {
+				path := wg.reconstructBidirectionalPath(meet, startID, endID, parentStart, parentEnd)
+				result.Found = true
+				result.Path = path
+				result.PathLength = len(path)
+				result.NodesVisited = nodesVisited
+				result.SearchTime = time.Since(searchStart)
+				return result
+			}
 		}
 	}
 
 	result.NodesVisited = nodesVisited
 	result.SearchTime = time.Since(searchStart)
-	log.Printf("No path found. Nodes visited: %d, Time: %s", nodesVisited, result.SearchTime)
-
 	return result
 }
 
-// reconstructPath rebuilds the path from parent pointers
-func (wg *WikiGraph) reconstructPath(parent map[string]string, start, end string) []string {
-	path := []string{}
-	current := end
-
-	for current != start {
-		path = append([]string{current}, path...)
-		current = parent[current]
-	}
-
-	path = append([]string{start}, path...)
-	return path
-}
-
-// GetNodeStatistics returns basic statistics about the graph
+// GetNodeStatistics returns node, edge, and average out-degree.
 func (wg *WikiGraph) GetNodeStatistics() (int, int, float64) {
-	totalEdges := 0
-	for _, links := range wg.adjacencyList {
-		totalEdges += len(links)
+	avgDegree := 0.0
+	if wg.nodeCount > 0 {
+		avgDegree = float64(wg.totalEdges) / float64(wg.nodeCount)
 	}
-
-	avgDegree := float64(totalEdges) / float64(wg.nodeCount)
-	return wg.nodeCount, totalEdges, avgDegree
+	return wg.nodeCount, wg.totalEdges, avgDegree
 }
 
-// DisplayPath formats and displays the path nicely
+// DisplayPath prints search results.
 func DisplayPath(result PathResult) {
 	fmt.Println("\n" + strings.Repeat("=", 80))
 	fmt.Println("WIKIPEDIA SHORTEST PATH RESULT")
 	fmt.Println(strings.Repeat("=", 80))
-	fmt.Println()
 
 	if !result.Found {
-		fmt.Println("❌ NO PATH FOUND")
-		fmt.Printf("⏱️ Search Time: %s\n", result.SearchTime)
-		fmt.Printf("🔍 Nodes Visited: %d\n", result.NodesVisited)
-	} else {
-		fmt.Println("✅ PATH FOUND!")
-		fmt.Printf("📏 Path Length: %d degrees\n", result.PathLength-1) // Exclude start article from length
-		fmt.Printf("⏱️ Search Time: %s\n", result.SearchTime)
-		fmt.Printf("🔍 Nodes Visited: %d\n", result.NodesVisited)
-		fmt.Println()
+		fmt.Println("NO PATH FOUND")
+		fmt.Printf("Search Time: %s\n", formatDurationMilliseconds(result.SearchTime))
+		fmt.Printf("Nodes Visited: %d\n", result.NodesVisited)
+		fmt.Printf("Start Out-Degree: %d\n", result.StartOutDeg)
+		fmt.Printf("End In-Degree: %d\n", result.EndInDeg)
+		fmt.Println(strings.Repeat("=", 80))
+		return
+	}
 
-		for i, article := range result.Path {
-			if i == 0 {
-				fmt.Printf("🚀 START:     %s\n", article)
-			} else if i == len(result.Path)-1 {
-				fmt.Printf("🎯 END:       %s\n", article)
-			} else {
-				fmt.Printf("⬇️ DEGREE %d:  %s\n", i, article)
-			}
+	fmt.Println("PATH FOUND")
+	fmt.Printf("Path Length: %d degrees\n", result.PathLength-1)
+	fmt.Printf("Search Time: %s\n", formatDurationMilliseconds(result.SearchTime))
+	fmt.Printf("Nodes Visited: %d\n", result.NodesVisited)
+	fmt.Println()
+
+	for i, article := range result.Path {
+		switch {
+		case i == 0:
+			fmt.Printf("START:      %s\n", article)
+		case i == len(result.Path)-1:
+			fmt.Printf("END:        %s\n", article)
+		default:
+			fmt.Printf("DEGREE %d:   %s\n", i, article)
 		}
 	}
 
-	fmt.Println()
 	fmt.Println(strings.Repeat("=", 80))
 }
 
-// Interactive mode for user input
 func runInteractiveMode(graph *WikiGraph) {
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Println("\n🌟 WIKIPEDIA PATHFINDER - Interactive Mode")
+	fmt.Println("\nWIKIPEDIA PATHFINDER - Interactive Mode")
 	fmt.Println("Type 'quit' to exit, 'stats' for graph statistics")
-	fmt.Println()
 
 	for {
 		fmt.Print("Enter start article: ")
 		startArticle, _ := reader.ReadString('\n')
 		startArticle = strings.TrimSpace(startArticle)
 
-		if strings.ToLower(startArticle) == "quit" {
-			break
-		}
-
-		if strings.ToLower(startArticle) == "stats" {
+		switch strings.ToLower(startArticle) {
+		case "quit":
+			return
+		case "stats":
 			nodes, edges, avgDegree := graph.GetNodeStatistics()
-			fmt.Printf("\n📊 Graph Statistics:\n")
-			fmt.Printf("   Nodes (Articles): %d\n", nodes)
-			fmt.Printf("   Edges (Links): %d\n", edges)
-			fmt.Printf("   Average Degree: %.2f\n\n", avgDegree)
+			fmt.Printf("\nGraph Statistics:\n")
+			fmt.Printf("  Nodes (Articles): %d\n", nodes)
+			fmt.Printf("  Edges (Links): %d\n", edges)
+			fmt.Printf("  Average Degree: %.2f\n\n", avgDegree)
 			continue
 		}
 
@@ -340,17 +434,16 @@ func runInteractiveMode(graph *WikiGraph) {
 		endArticle = strings.TrimSpace(endArticle)
 
 		if strings.ToLower(endArticle) == "quit" {
-			break
+			return
 		}
 
-		// Check if articles exist and provide suggestions
 		if !graph.ArticleExists(startArticle) {
-			fmt.Printf("❌ Start article '%s' not found.\n", startArticle)
+			fmt.Printf("Start article '%s' not found.\n", startArticle)
 			similar := graph.GetSimilarTitles(startArticle, 5)
 			if len(similar) > 0 {
-				fmt.Println("💡 Did you mean one of these?")
+				fmt.Println("Did you mean:")
 				for _, title := range similar {
-					fmt.Printf("   - %s\n", title)
+					fmt.Printf("  - %s\n", title)
 				}
 			}
 			fmt.Println()
@@ -358,19 +451,18 @@ func runInteractiveMode(graph *WikiGraph) {
 		}
 
 		if !graph.ArticleExists(endArticle) {
-			fmt.Printf("❌ End article '%s' not found.\n", endArticle)
+			fmt.Printf("End article '%s' not found.\n", endArticle)
 			similar := graph.GetSimilarTitles(endArticle, 5)
 			if len(similar) > 0 {
-				fmt.Println("💡 Did you mean one of these?")
+				fmt.Println("Did you mean:")
 				for _, title := range similar {
-					fmt.Printf("   - %s\n", title)
+					fmt.Printf("  - %s\n", title)
 				}
 			}
 			fmt.Println()
 			continue
 		}
 
-		// Perform BFS
 		result := graph.BFS(startArticle, endArticle)
 		DisplayPath(result)
 		fmt.Println()
@@ -378,27 +470,28 @@ func runInteractiveMode(graph *WikiGraph) {
 }
 
 func main() {
-    graphFilePath := "C:/WikiDump/wikipedia_graph_go.gob"
+	graphFilePath := flag.String("graph", "C:/WikiDump/wikipedia_graph_go.gob", "Path to graph Gob file")
+	startArticle := flag.String("start", "", "Start article for one-shot search")
+	endArticle := flag.String("end", "", "End article for one-shot search")
+	flag.Parse()
 
-	// Check if custom path is provided as command line argument
-	if len(os.Args) > 1 {
-		graphFilePath = os.Args[1]
-	}
-
-	// Load the Wikipedia graph
-	graph, err := NewWikiGraphFromGob(graphFilePath)
+	graph, err := NewWikiGraphFromGob(*graphFilePath)
 	if err != nil {
 		log.Fatalf("Failed to load graph: %v", err)
 	}
 
 	nodes, edges, avgDegree := graph.GetNodeStatistics()
-	fmt.Printf("📊 Loaded Wikipedia Graph:\n")
-	fmt.Printf("   Articles: %d\n", nodes)
-	fmt.Printf("   Links: %d\n", edges)
-	fmt.Printf("   Average links per article: %.2f\n\n", avgDegree)
+	fmt.Printf("Loaded Wikipedia Graph:\n")
+	fmt.Printf("  Articles: %d\n", nodes)
+	fmt.Printf("  Links: %d\n", edges)
+	fmt.Printf("  Average links per article: %.2f\n\n", avgDegree)
 
-	// Start interactive mode
+	if *startArticle != "" && *endArticle != "" {
+		result := graph.BFS(*startArticle, *endArticle)
+		DisplayPath(result)
+		return
+	}
+
 	runInteractiveMode(graph)
-
-	fmt.Println("👋 Thanks for using Wikipedia Pathfinder!")
+	fmt.Println("Thanks for using Wikipedia Pathfinder!")
 }
