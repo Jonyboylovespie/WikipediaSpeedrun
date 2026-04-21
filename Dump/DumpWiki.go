@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -336,15 +335,8 @@ func (wp *WikiProcessor) saveGraph(outputPath string) error {
 }
 
 func main() {
-	cur, err := os.Getwd()
-	if err != nil {
-		log.Fatalf("Error: %v", err)
-		return
-	}
-	dir := filepath.Dir(cur)
-
-	xmlFilePath := filepath.Join(dir, "Data", "enwiki-latest-pages-articles.xml")
-	outputPath := filepath.Join(dir, "Data", "wikipedia_graph_go.json")
+	xmlFilePath := "C:/WikiDump/enwiki-latest-pages-articles.xml"
+	outputPath := "C:/WikiDump/wikipedia_graph_go.json"
 	maxPages := 0 // 0 for unlimited, set a number for testing
 
 	processor := NewWikiProcessor(maxPages)

@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -379,14 +378,7 @@ func runInteractiveMode(graph *WikiGraph) {
 }
 
 func main() {
-	cur, err := os.Getwd()
-	if err != nil {
-		log.Fatalf("Error: %v", err)
-		return
-	}
-	dir := filepath.Dir(cur)
-	
-    graphFilePath := filepath.Join(dir, "Data", "wikipedia_graph_go.json")
+    graphFilePath := "C:/WikiDump/wikipedia_graph_go.json"
 
 	// Check if custom path is provided as command line argument
 	if len(os.Args) > 1 {
