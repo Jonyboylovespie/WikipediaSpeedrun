@@ -469,10 +469,6 @@ func main() {
 		log.Fatalf("Failed to load graph: %v", err)
 	}
 
-	fmt.Printf("Loaded Wikipedia Graph:\n")
-	fmt.Printf("  Articles: %d\n", graph.nodeCount)
-	fmt.Printf("  Links: %d\n", graph.edges)
-
 	if *startArticle != "" && *endArticle != "" {
 		result := graph.BFS(*startArticle, *endArticle)
 		DisplayPath(result)
