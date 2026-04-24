@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -203,21 +204,58 @@ func (wg *WikiGraph) GetSimilarTitles(title string, maxResults int) []string {
 		return nil
 	}
 
-	normalized := strings.ToLower(wg.normalizeTitle(title))
-	if normalized == "" {
+	normalizedTitle := wg.normalizeTitle(title)
+	query := strings.ToLower(strings.TrimSpace(normalizedTitle))
+	if query == "" {
 		return nil
 	}
 
-	results := make([]string, 0, maxResults)
+	type candidate struct {
+		idx   int
+		title string
+		score int
+	}
+
+	candidates := make([]candidate, 0, 16)
+
 	for i, lower := range wg.titleSearch {
-		if strings.Contains(lower, normalized) || strings.Contains(normalized, lower) {
-			results = append(results, wg.titles[i])
-			if len(results) >= maxResults {
-				break
+		// consider substring/prefix matches
+		if strings.Contains(lower, query) || strings.Contains(query, lower) {
+			sc := 1000
+			if strings.EqualFold(wg.titles[i], normalizedTitle) || lower == query {
+				sc = 0
+			} else if strings.HasPrefix(lower, query) {
+				sc = 10
+			} else if strings.HasPrefix(query, lower) {
+				sc = 20
+			} else if strings.Contains(lower, query) {
+				sc = 50
+			} else if strings.Contains(query, lower) {
+				sc = 60
 			}
+			candidates = append(candidates, candidate{idx: i, title: wg.titles[i], score: sc})
 		}
 	}
 
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// sort by score, then by shorter title, then alphabetically
+	sort.SliceStable(candidates, func(a, b int) bool {
+		if candidates[a].score != candidates[b].score {
+			return candidates[a].score < candidates[b].score
+		}
+		if len(candidates[a].title) != len(candidates[b].title) {
+			return len(candidates[a].title) < len(candidates[b].title)
+		}
+		return candidates[a].title < candidates[b].title
+	})
+
+	results := make([]string, 0, maxResults)
+	for i := 0; i < len(candidates) && len(results) < maxResults; i++ {
+		results = append(results, candidates[i].title)
+	}
 	return results
 }
 
@@ -418,14 +456,6 @@ func runInteractiveMode(graph *WikiGraph) {
 			continue
 		}
 
-		fmt.Print("Enter end article: ")
-		endArticle, _ := reader.ReadString('\n')
-		endArticle = strings.TrimSpace(endArticle)
-
-		if strings.ToLower(endArticle) == "quit" {
-			return
-		}
-
 		if !graph.ArticleExists(startArticle) {
 			fmt.Printf("Start article '%s' not found.\n", startArticle)
 			similar := graph.GetSimilarTitles(startArticle, 5)
@@ -439,22 +469,33 @@ func runInteractiveMode(graph *WikiGraph) {
 			continue
 		}
 
-		if !graph.ArticleExists(endArticle) {
-			fmt.Printf("End article '%s' not found.\n", endArticle)
-			similar := graph.GetSimilarTitles(endArticle, 5)
-			if len(similar) > 0 {
-				fmt.Println("Did you mean:")
-				for _, title := range similar {
-					fmt.Printf("  - %s\n", title)
-				}
-			}
-			fmt.Println()
-			continue
-		}
+		for {
+			fmt.Print("Enter end article: ")
+			endArticle, _ := reader.ReadString('\n')
+			endArticle = strings.TrimSpace(endArticle)
 
-		result := graph.BFS(startArticle, endArticle)
-		DisplayPath(result)
-		fmt.Println()
+			if strings.ToLower(endArticle) == "quit" {
+				return
+			}
+
+			if !graph.ArticleExists(endArticle) {
+				fmt.Printf("End article '%s' not found.\n", endArticle)
+				similar := graph.GetSimilarTitles(endArticle, 5)
+				if len(similar) > 0 {
+					fmt.Println("Did you mean:")
+					for _, title := range similar {
+						fmt.Printf("  - %s\n", title)
+					}
+				}
+				fmt.Println()
+				continue
+			}
+
+			result := graph.BFS(startArticle, endArticle)
+			DisplayPath(result)
+			fmt.Println()
+			break
+		}
 	}
 }
 
