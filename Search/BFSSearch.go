@@ -362,15 +362,6 @@ func (wg *WikiGraph) BFS(startTitle, endTitle string) PathResult {
 	return result
 }
 
-// GetNodeStatistics returns node, edge, and average out-degree.
-func (wg *WikiGraph) GetNodeStatistics() (int, int, float64) {
-	avgDegree := 0.0
-	if wg.nodeCount > 0 {
-		avgDegree = float64(wg.totalEdges) / float64(wg.nodeCount)
-	}
-	return wg.nodeCount, wg.totalEdges, avgDegree
-}
-
 // DisplayPath prints search results.
 func DisplayPath(result PathResult) {
 	fmt.Println("\n" + strings.Repeat("=", 80))
@@ -421,11 +412,9 @@ func runInteractiveMode(graph *WikiGraph) {
 		case "quit":
 			return
 		case "stats":
-			nodes, edges, avgDegree := graph.GetNodeStatistics()
 			fmt.Printf("\nGraph Statistics:\n")
-			fmt.Printf("  Nodes (Articles): %d\n", nodes)
-			fmt.Printf("  Edges (Links): %d\n", edges)
-			fmt.Printf("  Average Degree: %.2f\n\n", avgDegree)
+			fmt.Printf("  Nodes (Articles): %d\n", graph.nodeCount)
+			fmt.Printf("  Edges (Links): %d\n", graph.totalEdges)
 			continue
 		}
 
@@ -480,11 +469,9 @@ func main() {
 		log.Fatalf("Failed to load graph: %v", err)
 	}
 
-	nodes, edges, avgDegree := graph.GetNodeStatistics()
 	fmt.Printf("Loaded Wikipedia Graph:\n")
-	fmt.Printf("  Articles: %d\n", nodes)
-	fmt.Printf("  Links: %d\n", edges)
-	fmt.Printf("  Average links per article: %.2f\n\n", avgDegree)
+	fmt.Printf("  Articles: %d\n", graph.nodeCount)
+	fmt.Printf("  Links: %d\n", graph.edges)
 
 	if *startArticle != "" && *endArticle != "" {
 		result := graph.BFS(*startArticle, *endArticle)
